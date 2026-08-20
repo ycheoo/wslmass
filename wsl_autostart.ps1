@@ -1,19 +1,17 @@
-# WSL2 keepalive supervised by the NSSM service WSL_AUTOSTART.
-# The final foreground command must remain blocking; see README.md.
+# Attach physical disks and keep the default WSL distro running under NSSM.
+# See README.md for setup, parameters, logs, and troubleshooting.
 
 param(
-    # Comma- or semicolon-separated PHYSICALDRIVE numbers. Quote the
-    # value: unquoted, a stray space truncates the list silently.
     [string]$PhysicalDrives = ''
 )
 
-# Both must run before the first write; Console.Out caches its encoding.
+# Keep WSL output and the shared log in UTF-8.
 $env:WSL_UTF8 = 1
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# The backup script appends here too, hence the mutex. No BOM: it would
-# land on the first line and break an anchored grep.
+# The autostart and backup scripts share this log without interleaving lines.
 $logFile = "$env:USERPROFILE\wsl\logs\wsl.log"
+$logTag = 'AUTOSTART'
 $logEncoding = New-Object System.Text.UTF8Encoding($false)
 $logMutex = New-Object System.Threading.Mutex($false, 'Global\WSL_MANAGE_LOG')
 
@@ -25,14 +23,13 @@ function Write-Log {
         [ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level = 'INFO'
     )
 
-    $line = '{0} [{1}] [AUTOSTART] {2}' -f
-        (Get-Date).ToString('yyyy-MM-dd HH:mm:ssK'), $Level, $Message
+    $line = '{0} [{1}] [{2}] {3}' -f
+        (Get-Date).ToString('yyyy-MM-dd HH:mm:ssK'), $Level, $logTag, $Message
     $lockTaken = $false
     try {
         try {
             $lockTaken = $logMutex.WaitOne()
         } catch [System.Threading.AbandonedMutexException] {
-            # A holder died without releasing; the mutex is ours anyway.
             $lockTaken = $true
         }
         [System.IO.File]::AppendAllText($logFile, $line + [Environment]::NewLine, $logEncoding)
@@ -41,7 +38,7 @@ function Write-Log {
             $logMutex.ReleaseMutex()
         }
     }
-    Write-Output $line
+    Write-Host $line
 }
 
 Write-Log "=== wsl autostart starting (host=$env:COMPUTERNAME user=$env:USERNAME pid=$PID) ==="
@@ -71,7 +68,7 @@ foreach ($token in ($PhysicalDrives -split '[,;]')) {
     }
 }
 
-# Mount errors are logged but remain non-fatal by design.
+# Disk attachment failures are logged and startup continues.
 if ($driveList.Count -eq 0) {
     Write-Log "No physical drives requested."
 } else {
@@ -80,30 +77,47 @@ if ($driveList.Count -eq 0) {
 
 foreach ($d in $driveList) {
     Write-Log "Attaching \\.\PHYSICALDRIVE$d --bare"
-    foreach ($line in (wsl --mount "\\.\PHYSICALDRIVE$d" --bare 2>&1)) {
-        Write-Log "wsl.exe: $($line.ToString().Trim())"
+    $mounted = wsl --mount "\\.\PHYSICALDRIVE$d" --bare 2>&1 |
+        ForEach-Object { $_.ToString().Trim() }
+    # A service restart can find the disk still attached; report that as normal.
+    if ($mounted -match 'WSL_E_DISK_ALREADY_ATTACHED') {
+        Write-Log "\\.\PHYSICALDRIVE$d is already attached"
+    } else {
+        $mounted | ForEach-Object { Write-Log "wsl.exe: $_" }
     }
 }
 
-# Diagnostic only: a non-running systemd does not stop startup.
+# Wait up to one minute for systemd to settle. This is diagnostic only;
+# startup continues when the distro is degraded or does not answer.
 $probeScript = @(
+    'set -f'
     'echo distro=$WSL_DISTRO_NAME'
     'echo kernel=$(uname -r)'
-    'echo systemd=$(systemctl is-system-running 2>/dev/null)'
+    'end=$(( $(date +%s) + 60 ))'
+    'settled=yes'
+    'while :'
+    'do s=$(systemctl is-system-running 2>&1)'
+    'case $s in running|degraded|maintenance|stopping|offline) break ;; esac'
+    '[ $(date +%s) -ge $end ] && { settled=no; break; }'
+    'sleep 2'
+    'done'
+    'echo systemd=${s:-no-answer}'
+    'echo settled=$settled'
 ) -join '; '
 
-$probe = wsl -- sh -c $probeScript 2>&1
-Write-Log ("Distro probe: {0}" -f
-    (($probe | ForEach-Object { $_.ToString().Trim() }) -join ' | '))
+$probe = wsl -e sh -c $probeScript 2>&1
+$probeLine = ($probe | ForEach-Object { $_.ToString().Trim() }) -join ' | '
+# Only a fully running systemd state is logged as healthy.
+$level = if ($probeLine -match 'systemd=running') { 'INFO' } else { 'WARN' }
+Write-Log "Distro probe: $probeLine" $level
 
-# An explicit sleep, not a bare `wsl`: NSSM restarts on every exit, so
-# the workload must not end on its own.
-Write-Log "=== starting keepalive: wsl -- sleep infinity ==="
+# Keep this foreground command blocking so NSSM can supervise WSL.
+Write-Log "=== wsl autostart keepalive wsl -- sleep infinity ==="
 $startedAt = Get-Date
 wsl -- sleep infinity 2>&1 |
     ForEach-Object { Write-Log "wsl.exe: $($_.ToString().Trim())" }
 $uptime = (Get-Date) - $startedAt
 
-# Reaching here means the keepalive died; NSSM restarts the service.
-Write-Log ("keepalive exited after {0}, NSSM restarts the service" -f
+# Reaching this point means NSSM will restart the service.
+Write-Log ("=== wsl autostart keepalive exited after {0}, NSSM restarts the service ===" -f
     $uptime.ToString('d\.hh\:mm\:ss')) 'WARN'
