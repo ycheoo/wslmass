@@ -62,6 +62,7 @@ function Write-Log {
         try {
             $lockTaken = $logMutex.WaitOne()
         } catch [System.Threading.AbandonedMutexException] {
+            # A holder died without releasing; the mutex is ours anyway.
             $lockTaken = $true
         }
         [System.IO.File]::AppendAllText($logFile, $line + [Environment]::NewLine, $logEncoding)
